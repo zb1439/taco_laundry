@@ -4,8 +4,9 @@ Supports resumable execution with checkpointing.
 """
 import json
 import time
-import re
+import asyncio
 from pathlib import Path
+from openai import AsyncOpenAI
 from openai import OpenAI
 from tqdm import tqdm
 from datasets import Dataset, concatenate_datasets
@@ -111,7 +112,7 @@ def save_checkpoint(checkpoint):
 
 def call_openai_api(client, prompt, model_name, max_retries=3, retry_delay=5):
     """
-    Call OpenAI API with retry logic.
+    Call OpenAI API with retry logic (synchronous version).
     Returns (decision, reason) where decision=True means filter out (YES), False means keep (NO).
     """
     for attempt in range(max_retries):
@@ -138,12 +139,215 @@ def call_openai_api(client, prompt, model_name, max_retries=3, retry_delay=5):
                 raise
 
 
+async def call_openai_api_async(client, prompt, model_name, max_retries=3, retry_delay=5):
+    """
+    Call OpenAI API with retry logic (async version for concurrent processing).
+    Returns (decision, reason) where decision=True means filter out (YES), False means keep (NO).
+    """
+    for attempt in range(max_retries):
+        try:
+            # Try chat completions API (standard format)
+            response = await client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": RUBRICS},
+                    {"role": "user", "content": prompt}
+                ],
+            )
+            response_text = response.choices[0].message.content
+            is_hard_to_evaluate, reason = parse_response(response_text)
+            return is_hard_to_evaluate, reason
+        
+        except Exception as e:
+            if attempt < max_retries - 1:
+                await asyncio.sleep(retry_delay)
+            else:
+                print(f"API call failed after {max_retries} attempts: {e}")
+                raise
+
+
+async def process_sample_async(client, train_ds, idx, model_name, checkpoint):
+    """Process a single sample asynchronously."""
+    # Skip if already processed
+    if str(idx) in checkpoint["processed_indices"]:
+        decision = checkpoint["processed_indices"][str(idx)]["decision"]
+        return idx, decision, None, None
+    
+    try:
+        # Load and parse sample
+        sample = train_ds[idx]
+        sample = dict(sample)  # Convert to dict
+        sample["solutions"] = json.loads(sample["solutions"])
+        sample["input_output"] = json.loads(sample["input_output"])
+        sample["raw_tags"] = eval(sample["raw_tags"])
+        sample["tags"] = eval(sample["tags"])
+        sample["skill_types"] = eval(sample["skill_types"])
+        
+        # Create prompt
+        prompt = fulfill_prompt(sample)
+        
+        # Call OpenAI API
+        is_hard_to_evaluate, reason = await call_openai_api_async(client, prompt, model_name)
+        
+        # Decision: keep if NOT hard to evaluate (NO response)
+        should_keep = not is_hard_to_evaluate
+        decision = "keep" if should_keep else "filter"
+        
+        return idx, decision, reason, None
+        
+    except Exception as e:
+        return idx, None, None, e
+
+
+async def filter_dataset_async(
+    start_idx=0,
+    max_samples=None,
+    batch_size=100,
+    concurrency=10,
+    model_name='gpt-5-nano'
+):
+    """
+    Filter the training dataset using OpenAI API with concurrent processing.
+    
+    Args:
+        start_idx: Index to start from (for resuming)
+        max_samples: Maximum number of samples to process (None for all)
+        batch_size: Number of samples to process before saving checkpoint
+        concurrency: Number of concurrent API calls
+        model_name: OpenAI model to use
+    """
+    # Load dataset
+    print("Loading training dataset...")
+    train_files = sorted((root / "train").glob("data-*.arrow"))
+    train_datasets = [Dataset.from_file(str(f)) for f in train_files]
+    train_ds = concatenate_datasets(train_datasets)
+    
+    total_samples = len(train_ds)
+    print(f"Total samples in training set: {total_samples}")
+    
+    # Load checkpoint
+    checkpoint = load_checkpoint()
+    if checkpoint["total_samples"] == 0:
+        checkpoint["total_samples"] = total_samples
+    
+    # Determine end index
+    end_idx = total_samples
+    if max_samples:
+        end_idx = min(start_idx + max_samples, total_samples)
+    
+    # Get indices to process (skip already processed)
+    indices_to_process = [
+        idx for idx in range(start_idx, end_idx)
+        if str(idx) not in checkpoint["processed_indices"]
+    ]
+    
+    print(f"Starting from index {start_idx}, processing until {end_idx}")
+    print(f"Resuming from checkpoint: {len(checkpoint['processed_indices'])} samples already processed")
+    print(f"Remaining samples to process: {len(indices_to_process)}")
+    print(f"Using {concurrency} concurrent API calls")
+    
+    # Initialize async OpenAI client
+    client = AsyncOpenAI()
+    
+    # Process samples
+    processed_count = 0
+    kept_count = 0
+    filtered_count = 0
+    
+    # Process in batches with concurrency limit
+    semaphore = asyncio.Semaphore(concurrency)
+    
+    async def process_with_semaphore(idx):
+        async with semaphore:
+            return await process_sample_async(client, train_ds, idx, model_name, checkpoint)
+    
+    # Process all samples concurrently with progress bar
+    tasks = [process_with_semaphore(idx) for idx in indices_to_process]
+    
+    # Use tqdm for progress tracking
+    pbar = tqdm(total=len(tasks), desc="Processing samples")
+    
+    for coro in asyncio.as_completed(tasks):
+        try:
+            idx, decision, reason, error = await coro
+            pbar.update(1)
+            
+            if error:
+                print(f"\nError processing sample {idx}: {error}")
+                continue
+            
+            if decision is None:
+                # Already processed, skip
+                continue
+            
+            # Update checkpoint
+            checkpoint["processed_indices"][str(idx)] = {
+                "decision": decision,
+                "reason": reason,
+                "timestamp": time.time()
+            }
+            
+            if decision == "keep":
+                if idx not in checkpoint["kept_indices"]:
+                    checkpoint["kept_indices"].append(idx)
+                kept_count += 1
+            else:
+                if idx not in checkpoint["filtered_indices"]:
+                    checkpoint["filtered_indices"].append(idx)
+                filtered_count += 1
+            
+            checkpoint["last_processed_idx"] = max(checkpoint.get("last_processed_idx", -1), idx)
+            processed_count += 1
+            
+            # Save checkpoint periodically
+            if processed_count % batch_size == 0:
+                save_checkpoint(checkpoint)
+                pbar.set_postfix({
+                    'kept': kept_count,
+                    'filtered': filtered_count,
+                    'saved': '✓'
+                })
+        
+        except KeyboardInterrupt:
+            pbar.close()
+            print("\nInterrupted by user. Saving checkpoint...")
+            save_checkpoint(checkpoint)
+            print(f"Checkpoint saved. Last processed index: {checkpoint.get('last_processed_idx', 'unknown')}")
+            raise
+        
+        except Exception as e:
+            pbar.close()
+            print(f"\nUnexpected error: {e}")
+            save_checkpoint(checkpoint)
+            raise
+    
+    pbar.close()
+    
+    # Close async client
+    await client.close()
+    
+    # Final save
+    save_checkpoint(checkpoint)
+    
+    # Print summary
+    print("\n" + "="*60)
+    print("Filtering complete!")
+    print(f"Total processed: {processed_count}")
+    print(f"Samples kept: {kept_count}")
+    print(f"Samples filtered: {filtered_count}")
+    if processed_count > 0:
+        print(f"Keep rate: {100*kept_count/processed_count:.1f}%")
+    print(f"Checkpoint saved to: {CHECKPOINT_FILE}")
+    print("="*60)
+
+
 def filter_dataset(
     start_idx=0,
     max_samples=None,
     batch_size=100,
     api_delay=0.1,
-    model_name='gpt-5-nano'
+    model_name='gpt-5-nano',
+    concurrency=10
 ):
     """
     Filter the training dataset using OpenAI API.
@@ -152,9 +356,21 @@ def filter_dataset(
         start_idx: Index to start from (for resuming)
         max_samples: Maximum number of samples to process (None for all)
         batch_size: Number of samples to process before saving checkpoint
-        api_delay: Delay between API calls in seconds
+        api_delay: Delay between API calls in seconds (only used if concurrency=1)
         model_name: OpenAI model to use
+        concurrency: Number of concurrent API calls (use 1 for sequential, >1 for parallel)
     """
+    # Use async version if concurrency > 1
+    if concurrency > 1:
+        return asyncio.run(filter_dataset_async(
+            start_idx=start_idx,
+            max_samples=max_samples,
+            batch_size=batch_size,
+            concurrency=concurrency,
+            model_name=model_name
+        ))
+    
+    # Sequential version (original implementation)
     # Load dataset
     print("Loading training dataset...")
     train_files = sorted((root / "train").glob("data-*.arrow"))
@@ -285,9 +501,11 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=100,
                         help="Checkpoint save frequency")
     parser.add_argument("--api_delay", type=float, default=0.1,
-                        help="Delay between API calls (seconds)")
+                        help="Delay between API calls in seconds (only used if concurrency=1)")
     parser.add_argument("--model", type=str, default="gpt-5-nano",
                         help="OpenAI model to use")
+    parser.add_argument("--concurrency", type=int, default=10,
+                        help="Number of concurrent API calls (higher = faster but more API usage)")
     
     args = parser.parse_args()
     
@@ -296,6 +514,7 @@ if __name__ == "__main__":
         max_samples=args.max_samples,
         batch_size=args.batch_size,
         api_delay=args.api_delay,
-        model_name=args.model
+        model_name=args.model,
+        concurrency=args.concurrency
     )
 
